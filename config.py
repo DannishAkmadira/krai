@@ -3,32 +3,36 @@
 #  Semua konstanta global untuk Robot Control App
 # ─────────────────────────────────────────────
 
-# ── NETWORK ───────────────────────────────────
-ESP32_IP        = "192.168.4.1"   # IP ESP32 (mode AP) atau sesuaikan
-ESP32_PORT      = 8080            # Port TCP untuk command
-CAMERA_URL      = "http://192.168.4.1:81/stream"  # URL MJPEG stream ESP32-CAM
-SOCKET_TIMEOUT  = 3               # detik
+# ── MQTT ──────────────────────────────────────
+MQTT_HOST      = "xxxx.s1.eu.hivemq.cloud"  # ganti dengan host HiveMQ
+MQTT_PORT      = 8883                        # port TLS HiveMQ cloud
+MQTT_USERNAME  = "username"                  # ganti dengan username HiveMQ
+MQTT_PASSWORD  = "password"                  # ganti dengan password HiveMQ
+MQTT_CLIENT_ID = "robot_control_laptop"
+MQTT_KEEPALIVE = 60                          # detik
+
+# ── MQTT TOPICS ───────────────────────────────
+TOPIC_MOVE     = "robot/move"       # payload: w | s | a | d | stop
+TOPIC_SPEED    = "robot/speed"      # payload: 0-255
+TOPIC_FORKLIFT = "robot/forklift"   # payload: up | down | stop
+
+# ── CAMERA ────────────────────────────────────
+CAMERA_URL        = "http://192.168.4.1:81/stream"
+CAMERA_FPS_TARGET = 30
+CAMERA_WIDTH      = 640
+CAMERA_HEIGHT     = 480
 
 # ── COMMAND BYTES (gerak) ─────────────────────
 CMD = {
-    "stop": b"\x00",
-    "w":    b"\x01",   # maju
-    "s":    b"\x02",   # mundur
-    "a":    b"\x03",   # kiri
-    "d":    b"\x04",   # kanan
+    "stop":      b"\x00",
+    "w":         b"\x01",   # maju
+    "s":         b"\x02",   # mundur
+    "a":         b"\x03",   # kiri
+    "d":         b"\x04",   # kanan
+    "lift_up":   b"\x05",   # forklift naik  (Q)
+    "lift_down": b"\x06",   # forklift turun (E)
+    "lift_stop": b"\x07",   # forklift stop
 }
-CMD_SPEED_HEADER = 0xFF           # prefix byte untuk paket kecepatan
-
-# ── BATTERY ───────────────────────────────────
-BATTERY_MAX_VOLT  = 12.6
-BATTERY_MIN_VOLT  = 9.0
-BATTERY_WARN_PCT  = 0.3           # kuning di bawah 30%
-BATTERY_CRIT_PCT  = 0.15          # merah di bawah 15%
-
-# ── CAMERA ────────────────────────────────────
-CAMERA_FPS_TARGET = 30            # target FPS tampilan
-CAMERA_WIDTH      = 640
-CAMERA_HEIGHT     = 480
 
 # ── COLORS ────────────────────────────────────
 BG       = "#0d0f12"

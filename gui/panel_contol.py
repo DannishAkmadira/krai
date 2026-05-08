@@ -52,6 +52,19 @@ class PanelControl(tk.Frame):
         # ── separator ──
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=10, pady=4)
 
+        # ── Forklift ──
+        tk.Label(self, text="── FORKLIFT  ( Q / E )",
+                 bg=PANEL, fg=TEXTDIM,
+                 font=(FONT_FAMILY, 8),
+                 padx=10, pady=6).pack(anchor="w")
+
+        fork_frame = tk.Frame(self, bg=PANEL)
+        fork_frame.pack(pady=(0, 6))
+        self._build_forklift(fork_frame)
+
+        # ── separator ──
+        tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=10, pady=4)
+
         # ── Speed ──
         tk.Label(self, text="── AKSELERASI  ( SCROLL WHEEL )",
                  bg=PANEL, fg=TEXTDIM,
@@ -111,6 +124,48 @@ class PanelControl(tk.Frame):
         for key, btn in self._dpad_map.items():
             btn.bind("<ButtonPress-1>",   lambda e, k=key: self._on_btn_press(k))
             btn.bind("<ButtonRelease-1>", lambda e, k=key: self._on_btn_release(k))
+
+    def _build_forklift(self, parent):
+        fork_cfg = dict(
+            bg=BORDER, fg=WHITE,
+            font=(FONT_FAMILY, 9),
+            bd=0, relief="flat",
+            activebackground=YELLOW,
+            activeforeground=BG,
+            width=8, height=2,
+            cursor="hand2",
+        )
+
+        # tombol naik
+        self._btn_lift_up = tk.Button(parent, text="▲  UP\n( Q )", **fork_cfg)
+        self._btn_lift_up.grid(row=0, column=0, padx=6, pady=4)
+
+        # tombol stop forklift
+        self._btn_lift_stop = tk.Button(
+            parent, text="■\nHOLD",
+            bg="#0a0a1a", fg=YELLOW,
+            font=(FONT_FAMILY, 9),
+            bd=0, relief="flat",
+            activebackground=YELLOW,
+            activeforeground=BG,
+            width=5, height=2,
+            cursor="hand2",
+            command=lambda: self._fire_command("lift_stop"),
+        )
+        self._btn_lift_stop.grid(row=0, column=1, padx=6, pady=4)
+
+        # tombol turun
+        self._btn_lift_down = tk.Button(parent, text="▼  DOWN\n( E )", **fork_cfg)
+        self._btn_lift_down.grid(row=0, column=2, padx=6, pady=4)
+
+        # map forklift
+        self._fork_map = {
+            "lift_up":   self._btn_lift_up,
+            "lift_down": self._btn_lift_down,
+        }
+        for key, btn in self._fork_map.items():
+            btn.bind("<ButtonPress-1>",   lambda e, k=key: self._on_fork_press(k))
+            btn.bind("<ButtonRelease-1>", lambda e, k=key: self._on_fork_release(k))
 
     def _build_speed(self, parent):
         # angka kecepatan besar
@@ -173,6 +228,14 @@ class PanelControl(tk.Frame):
             self._active_keys.add(key)
             self._highlight(key, True)
             self._fire_command(key)
+        elif key == "q" and "lift_up" not in self._active_keys:
+            self._active_keys.add("lift_up")
+            self._highlight_fork("lift_up", True)
+            self._fire_command("lift_up")
+        elif key == "e" and "lift_down" not in self._active_keys:
+            self._active_keys.add("lift_down")
+            self._highlight_fork("lift_down", True)
+            self._fire_command("lift_down")
 
     def _on_key_release(self, event):
         key = event.keysym.lower()
@@ -181,6 +244,14 @@ class PanelControl(tk.Frame):
             self._highlight(key, False)
             if not self._active_keys:
                 self._fire_command("stop")
+        elif key == "q" and "lift_up" in self._active_keys:
+            self._active_keys.discard("lift_up")
+            self._highlight_fork("lift_up", False)
+            self._fire_command("lift_stop")
+        elif key == "e" and "lift_down" in self._active_keys:
+            self._active_keys.discard("lift_down")
+            self._highlight_fork("lift_down", False)
+            self._fire_command("lift_stop")
 
     # ── MOUSE CLICK ───────────────────────────
 
@@ -200,6 +271,16 @@ class PanelControl(tk.Frame):
         for key in self._dpad_map:
             self._highlight(key, False)
         self._fire_command("stop")
+
+    def _on_fork_press(self, key: str):
+        self._active_keys.add(key)
+        self._highlight_fork(key, True)
+        self._fire_command(key)
+
+    def _on_fork_release(self, key: str):
+        self._active_keys.discard(key)
+        self._highlight_fork(key, False)
+        self._fire_command("lift_stop")
 
     # ── SCROLL WHEEL ──────────────────────────
 
@@ -225,6 +306,14 @@ class PanelControl(tk.Frame):
         if btn:
             btn.configure(
                 bg=ACCENT if active else BORDER,
+                fg=BG     if active else WHITE,
+            )
+
+    def _highlight_fork(self, key: str, active: bool):
+        btn = self._fork_map.get(key)
+        if btn:
+            btn.configure(
+                bg=YELLOW if active else BORDER,
                 fg=BG     if active else WHITE,
             )
 
@@ -266,9 +355,15 @@ class PanelControl(tk.Frame):
         for btn in self._dpad_map.values():
             btn.configure(state="disabled", bg="#0d0f12", fg=TEXTDIM)
         self._btn_stop.configure(state="disabled")
+        for btn in self._fork_map.values():
+            btn.configure(state="disabled", bg="#0d0f12", fg=TEXTDIM)
+        self._btn_lift_stop.configure(state="disabled")
 
     def enable(self):
         """Aktifkan kembali semua tombol."""
         for btn in self._dpad_map.values():
             btn.configure(state="normal", bg=BORDER, fg=WHITE)
         self._btn_stop.configure(state="normal")
+        for btn in self._fork_map.values():
+            btn.configure(state="normal", bg=BORDER, fg=WHITE)
+        self._btn_lift_stop.configure(state="normal")
