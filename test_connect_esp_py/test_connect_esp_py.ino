@@ -1,182 +1,245 @@
-/*
-  ESP32 + HiveMQ Cloud (MQTT over TLS 8883) + PWM (LEDC)
-  Subscribes:
-    - robot/move      payload: w|a|s|d|stop
-    - robot/speed     payload: 0-255
-    - robot/forklift  payload: up|down|stop
-
-  Library:
-    - PubSubClient (by Nick O'Leary)
-*/
-
+#include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
+#include <WiFiClient.h>
 #include <PubSubClient.h>
 
-// ====== WiFi ======
+// =========================
+// User Config
+// =========================
 const char* WIFI_SSID     = "Summonfauzan";
 const char* WIFI_PASSWORD = "yesking123";
 
-// ====== HiveMQ Cloud MQTT (same as your Python config) ======
-const char* MQTT_HOST     = "19040673f194410aa8d14e110b14a8bd.s1.eu.hivemq.cloud";
-const int   MQTT_PORT     = 8883;  // TLS
-const char* MQTT_USERNAME = "Fauzan1";
-const char* MQTT_PASSWORD = "Hello123";
-const char* MQTT_CLIENT_ID = "robot_control_esp32"; // must be UNIQUE vs laptop
+const char* MQTT_HOST      = "10.10.23.220";
+const int   MQTT_PORT      = 1883;
+const char* MQTT_CLIENT_ID = "robot_gateway_esp32_1";
 
-// ====== Topics (same as your Python config) ======
+const char* MQTT_USERNAME = "";
+const char* MQTT_PASSWORD = "";
+
+// Topics
 const char* TOPIC_MOVE     = "robot/move";
 const char* TOPIC_SPEED    = "robot/speed";
 const char* TOPIC_FORKLIFT = "robot/forklift";
 
-// ====== TLS ======
-// For quick testing without CA cert (NOT recommended for production)
-#define USE_INSECURE_TLS 1
+// UART (ESP1 <-> ESP2 Motor)
+static const int UART_RX = 16;
+static const int UART_TX = 17;
+static const int UART_BAUD = 115200;
 
-WiFiClientSecure tlsClient;
-PubSubClient mqtt(tlsClient);
+// =========================
+// Tunables (Brownout mitigation)
+// =========================
+static const bool DEBUG_LOG = true;
 
-// ====== Motor / PWM pins (EDIT to match your wiring) ======
-const int PIN_PWM_SPEED = 25;   // PWM output to motor driver ENA/ENB
-const int PIN_DIR1      = 26;   // direction pin 1
-const int PIN_DIR2      = 27;   // direction pin 2
+// Delay before ANY WiFi activity (rail settle after boot + UART)
+static const uint32_t BOOT_SOFTSTART_MS = 5000;
 
-// Optional forklift pins (edit or remove if unused)
-const int PIN_LIFT_UP   = 32;
-const int PIN_LIFT_DOWN = 33;
+// Once WiFi connects, wait before first MQTT connect attempt
+static const uint32_t WIFI_SETTLE_BEFORE_MQTT_MS = 3000;
 
-// ====== LEDC PWM settings ======
-const int PWM_CH   = 0;
-const int PWM_FREQ = 20000;     // 20kHz typical for DC motor drivers
-const int PWM_RES  = 8;         // 8-bit => duty 0..255
+// Backoff between attempts
+static const uint32_t WIFI_RETRY_MS = 2000;
+static const uint32_t MQTT_RETRY_MS = 2000;
 
-volatile int g_speed = 0;       // 0..255
+// If your link is strong, lowering TX power helps current spikes.
+// Try: WIFI_POWER_2dBm / 5dBm / 8_5dBm / 11dBm ...
+static const wifi_power_t WIFI_TX_POWER = WIFI_POWER_8_5dBm;
 
-void setMotorStop() {
-  digitalWrite(PIN_DIR1, LOW);
-  digitalWrite(PIN_DIR2, LOW);
-  ledcWrite(PWM_CH, 0);
-}
+// Reduce peak draw; 80 MHz is usually enough for gateway duties.
+static const uint32_t CPU_FREQ_MHZ = 80;
 
-void setMotorForward() {
-  digitalWrite(PIN_DIR1, HIGH);
-  digitalWrite(PIN_DIR2, LOW);
-  ledcWrite(PWM_CH, g_speed);
-}
+// =========================
+// Globals
+// =========================
+HardwareSerial MotorSerial(2);
 
-void setMotorBackward() {
-  digitalWrite(PIN_DIR1, LOW);
-  digitalWrite(PIN_DIR2, HIGH);
-  ledcWrite(PWM_CH, g_speed);
-}
+WiFiClient netClient;
+PubSubClient mqtt(netClient);
 
-// If you have differential drive (left/right), you’ll want TWO PWM channels + 4 dir pins.
-// For now this keeps it simple: only forward/back/stop.
-void handleMove(const String& cmd) {
-  if (cmd == "stop") setMotorStop();
-  else if (cmd == "w") setMotorForward();
-  else if (cmd == "s") setMotorBackward();
-  else if (cmd == "a") {
-    // placeholder: implement your steering (e.g., left motor slower)
-    // for single motor demo, just stop
-    setMotorStop();
-  }
-  else if (cmd == "d") {
-    // placeholder
-    setMotorStop();
+static bool wifiWasConnected = false;
+static uint32_t wifiConnectedAtMs = 0;
+
+// =========================
+// UART helpers (low allocation)
+// =========================
+static void uartSendLine(const char* s) {
+  MotorSerial.print(s);
+  MotorSerial.print('\n');
+  if (DEBUG_LOG) {
+    Serial.print("UART->MOTOR: ");
+    Serial.println(s);
   }
 }
 
-void handleForklift(const String& cmd) {
-  if (cmd == "up") {
-    digitalWrite(PIN_LIFT_UP, HIGH);
-    digitalWrite(PIN_LIFT_DOWN, LOW);
-  } else if (cmd == "down") {
-    digitalWrite(PIN_LIFT_UP, LOW);
-    digitalWrite(PIN_LIFT_DOWN, HIGH);
-  } else { // "stop"
-    digitalWrite(PIN_LIFT_UP, LOW);
-    digitalWrite(PIN_LIFT_DOWN, LOW);
+static void uartSendKeyVal3(const char* key3, const byte* payload, unsigned int length) {
+  MotorSerial.write((const uint8_t*)key3, 3);
+  MotorSerial.write(':');
+  MotorSerial.write(payload, length);
+  MotorSerial.write('\n');
+
+  if (DEBUG_LOG) {
+    Serial.print("UART->MOTOR: ");
+    Serial.write((const uint8_t*)key3, 3);
+    Serial.print(":");
+    Serial.write(payload, length);
+    Serial.println();
   }
 }
 
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  String t(topic);
-  String msg;
-  msg.reserve(length);
-  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
-  msg.trim();
-
-  if (t == TOPIC_SPEED) {
-    int v = msg.toInt();
-    if (v < 0) v = 0;
-    if (v > 255) v = 255;
-    g_speed = v;
-
-    // Update PWM immediately (keeps current direction)
-    ledcWrite(PWM_CH, g_speed);
+// =========================
+// MQTT callback
+// =========================
+static void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  // Trim trailing whitespace
+  while (length > 0) {
+    byte c = payload[length - 1];
+    if (c == '\r' || c == '\n' || c == ' ' || c == '\t') length--;
+    else break;
   }
-  else if (t == TOPIC_MOVE) {
-    handleMove(msg);
-  }
-  else if (t == TOPIC_FORKLIFT) {
-    handleForklift(msg);
+
+  if (strcmp(topic, TOPIC_SPEED) == 0) {
+    uartSendKeyVal3("SPD", payload, length);
+  } else if (strcmp(topic, TOPIC_MOVE) == 0) {
+    uartSendKeyVal3("MOV", payload, length);
+  } else if (strcmp(topic, TOPIC_FORKLIFT) == 0) {
+    uartSendKeyVal3("FRK", payload, length);
   }
 }
 
-void connectWiFi() {
+// =========================
+// Connectivity (non-blocking attempts)
+// =========================
+static void ensureWiFiOnce() {
+  static uint32_t lastAttemptMs = 0;
+  const uint32_t now = millis();
+
+  if (WiFi.status() == WL_CONNECTED) return;
+  if ((uint32_t)(now - lastAttemptMs) < WIFI_RETRY_MS) return;
+  lastAttemptMs = now;
+
+  if (DEBUG_LOG) Serial.println("WiFi: begin()");
+
   WiFi.mode(WIFI_STA);
+
+  // Reduce current spikes (trade-offs: latency / throughput)
+  WiFi.setSleep(true);
+  WiFi.setTxPower(WIFI_TX_POWER);
+
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(300);
+}
+
+static void onWiFiStateTick() {
+  wl_status_t st = WiFi.status();
+
+  if (st == WL_CONNECTED) {
+    if (!wifiWasConnected) {
+      wifiWasConnected = true;
+      wifiConnectedAtMs = millis();
+      if (DEBUG_LOG) {
+        Serial.print("WiFi: connected, IP=");
+        Serial.println(WiFi.localIP());
+        Serial.println("WiFi: settling before MQTT...");
+      }
+    }
+  } else {
+    wifiWasConnected = false;
   }
 }
 
-void connectMQTT() {
-#if USE_INSECURE_TLS
-  tlsClient.setInsecure(); // skips certificate verification
-#endif
+static void ensureMQTTOnce() {
+  static uint32_t lastAttemptMs = 0;
+  const uint32_t now = millis();
+
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (!wifiWasConnected) return;
+
+  // Wait a bit after WiFi connects before first MQTT connect
+  if ((uint32_t)(now - wifiConnectedAtMs) < WIFI_SETTLE_BEFORE_MQTT_MS) return;
+
+  if (mqtt.connected()) return;
+  if ((uint32_t)(now - lastAttemptMs) < MQTT_RETRY_MS) return;
+  lastAttemptMs = now;
 
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setCallback(mqttCallback);
 
-  while (!mqtt.connected()) {
-    // connect(clientID, username, password)
-    if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD)) {
-      mqtt.subscribe(TOPIC_MOVE, 1);
-      mqtt.subscribe(TOPIC_SPEED, 1);
-      mqtt.subscribe(TOPIC_FORKLIFT, 1);
-    } else {
-      delay(2000);
-    }
+  if (DEBUG_LOG) {
+    Serial.print("MQTT: connect ");
+    Serial.print(MQTT_HOST);
+    Serial.print(":");
+    Serial.println(MQTT_PORT);
   }
+
+  bool ok;
+  if (strlen(MQTT_USERNAME) > 0) ok = mqtt.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD);
+  else ok = mqtt.connect(MQTT_CLIENT_ID);
+
+  if (!ok) {
+    if (DEBUG_LOG) {
+      Serial.print("MQTT: failed rc=");
+      Serial.println(mqtt.state());
+    }
+    return;
+  }
+
+  if (DEBUG_LOG) Serial.println("MQTT: connected");
+
+  // Spread the work slightly
+  delay(200);
+
+  mqtt.subscribe(TOPIC_MOVE, 1);
+  delay(50);
+  mqtt.subscribe(TOPIC_SPEED, 1);
+  delay(50);
+  mqtt.subscribe(TOPIC_FORKLIFT, 1);
+
+  uartSendLine("MOV:stop");
 }
 
+// =========================
+// Setup / Loop
+// =========================
 void setup() {
-  pinMode(PIN_DIR1, OUTPUT);
-  pinMode(PIN_DIR2, OUTPUT);
+  Serial.begin(115200);
+  delay(50);
 
-  pinMode(PIN_LIFT_UP, OUTPUT);
-  pinMode(PIN_LIFT_DOWN, OUTPUT);
+  // Lower CPU freq early (helps peak draw)
+  setCpuFrequencyMhz(CPU_FREQ_MHZ);
 
-  // Setup PWM
-  ledcSetup(PWM_CH, PWM_FREQ, PWM_RES);
-  ledcAttachPin(PIN_PWM_SPEED, PWM_CH);
-  ledcWrite(PWM_CH, 0);
+  // UART to motor ESP
+  MotorSerial.begin(UART_BAUD, SERIAL_8N1, UART_RX, UART_TX);
+  delay(200);
+  uartSendLine("HELLO");
 
-  setMotorStop();
-  handleForklift("stop");
+  // Soft-start before any WiFi activity
+  if (DEBUG_LOG) {
+    Serial.print("Soft-start delay ms=");
+    Serial.println(BOOT_SOFTSTART_MS);
+  }
+  delay(BOOT_SOFTSTART_MS);
 
-  connectWiFi();
-  connectMQTT();
+  // Kick off first WiFi attempt (non-blocking)
+  ensureWiFiOnce();
 }
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    connectWiFi();
+  ensureWiFiOnce();
+  onWiFiStateTick();
+  ensureMQTTOnce();
+
+  if (mqtt.connected()) {
+    mqtt.loop();
   }
-  if (!mqtt.connected()) {
-    connectMQTT();
+
+  // Optional: read anything from motor ESP (keep it light)
+  while (MotorSerial.available()) {
+    String line = MotorSerial.readStringUntil('\n');
+    line.trim();
+    if (line.length() && DEBUG_LOG) {
+      Serial.print("MOTOR->UART: ");
+      Serial.println(line);
+    }
   }
-  mqtt.loop();
+
+  delay(5);
 }
