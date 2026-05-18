@@ -9,7 +9,7 @@
 const char* WIFI_SSID     = "Summonfauzan";
 const char* WIFI_PASSWORD = "yesking123";
 
-const char* MQTT_HOST      = "10.10.23.220";
+const char* MQTT_HOST      = "10.90.50.32";
 const int   MQTT_PORT      = 1883;
 const char* MQTT_CLIENT_ID = "robot_gateway_esp32_1";
 

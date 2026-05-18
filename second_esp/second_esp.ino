@@ -1,162 +1,218 @@
 #include <Arduino.h>
-#include <WiFi.h>
-#include <WiFiClient.h>
-#include <PubSubClient.h>
 
-// ===== WiFi =====
-const char* WIFI_SSID     = "Summonfauzan";
-const char* WIFI_PASSWORD = "yesking123";
-
-// ===== MQTT (Mosquitto on PC) =====
-const char* MQTT_HOST      = "10.10.23.220";
-const int   MQTT_PORT      = 1883;
-const char* MQTT_CLIENT_ID = "robot_gateway_esp32_1";
-
-const char* MQTT_USERNAME = "";
-const char* MQTT_PASSWORD = "";
-
-// Topics
-const char* TOPIC_MOVE     = "robot/move";
-const char* TOPIC_SPEED    = "robot/speed";
-const char* TOPIC_FORKLIFT = "robot/forklift";
-
-// ===== UART =====
-static const int UART_RX = 16;
-static const int UART_TX = 17;
+// ===== UART from Gateway ESP (ESP1) =====
+static const int UART_RX = 16;     // ESP2 RX2  (from ESP1 TX GPIO17)
+static const int UART_TX = 17;     // ESP2 TX2  (optional back)
 static const int UART_BAUD = 115200;
+HardwareSerial GatewaySerial(2);
 
-HardwareSerial MotorSerial(2);
+// ===== Motor pin map =====
+const int M1_PWM_PIN  = 18;
+const int M1_DIR1_PIN = 19;
+const int M1_DIR2_PIN = 23;
+const int M1_FREQ     = 933;
 
-WiFiClient netClient;
-PubSubClient mqtt(netClient);
+const int M2_PWM_PIN  = 21;
+const int M2_DIR1_PIN = 22;
+const int M2_DIR2_PIN = 25;
+const int M2_FREQ     = 833;
 
-// (A) Reduce prints / work
-static const bool DEBUG_LOG = true;
+const int RESOLUTION = 8;
+const int DEAD_TIME_MS = 50;
 
-// Simple helpers (avoid lots of String concatenations)
-static void sendRawToMotor(const char* s) {
-  MotorSerial.print(s);
-  MotorSerial.print('\n');
-  if (DEBUG_LOG) {
-    Serial.print("UART->MOTOR: ");
-    Serial.println(s);
-  }
+enum Dir : uint8_t { DIR_STOP = 0, DIR_FWD = 1, DIR_REV = 2 };
+
+volatile Dir g_m1_dir = DIR_STOP;
+volatile Dir g_m2_dir = DIR_STOP;
+volatile uint8_t g_duty = 180;
+
+SemaphoreHandle_t g_ctrlMutex;
+
+// ===== Optional: scope-friendly self-test =====
+static const bool SELFTEST_ENABLE = true;
+static const uint32_t SELFTEST_AFTER_MS = 3000;   // if no MOV received after 3s
+static const uint32_t SELFTEST_ON_MS    = 1000;   // run 1s
+static const uint32_t SELFTEST_OFF_MS   = 500;    // stop 0.5s
+
+static volatile bool g_seenMoveCmd = false;
+
+static inline uint8_t clampDuty(int v) {
+  if (v < 0) return 0;
+  if (v > 255) return 255;
+  return (uint8_t)v;
 }
 
-static void sendKeyValToMotor(const char* key3, const byte* payload, unsigned int length) {
-  // Sends: "KEY:xxxxx\n" without building big Strings
-  MotorSerial.write((const uint8_t*)key3, 3);
-  MotorSerial.write(':');
-  MotorSerial.write(payload, length);
-  MotorSerial.write('\n');
+static void motorApply(int pwmPin, int dir1Pin, int dir2Pin, Dir newDir, uint8_t duty) {
+  // Stop PWM first (safe switching)
+  ledcWrite(pwmPin, 0);
 
-  if (DEBUG_LOG) {
-    Serial.print("UART->MOTOR: ");
-    Serial.write((const uint8_t*)key3, 3);
-    Serial.print(":");
-    Serial.write(payload, length);
-    Serial.println();
+  digitalWrite(dir1Pin, LOW);
+  digitalWrite(dir2Pin, LOW);
+  vTaskDelay(pdMS_TO_TICKS(DEAD_TIME_MS));
+
+  if (newDir == DIR_STOP) {
+    // Keep it stopped
+    ledcWrite(pwmPin, 0);
+    digitalWrite(dir1Pin, LOW);
+    digitalWrite(dir2Pin, LOW);
+    return;
   }
+
+  if (newDir == DIR_FWD) {
+    digitalWrite(dir1Pin, HIGH);
+    digitalWrite(dir2Pin, LOW);
+  } else { // DIR_REV
+    digitalWrite(dir1Pin, LOW);
+    digitalWrite(dir2Pin, HIGH);
+  }
+
+  vTaskDelay(pdMS_TO_TICKS(DEAD_TIME_MS));
+  ledcWrite(pwmPin, duty);
 }
 
-static void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  // Trim whitespace at ends (without allocating)
-  while (length > 0 && (payload[length - 1] == '\r' || payload[length - 1] == '\n' || payload[length - 1] == ' ' || payload[length - 1] == '\t')) {
-    length--;
-  }
+static void motorTask1(void* pv) {
+  Dir lastDir = (Dir)255;
+  uint8_t lastDuty = 255;
 
-  if (strcmp(topic, TOPIC_SPEED) == 0) {
-    sendKeyValToMotor("SPD", payload, length);
-  } else if (strcmp(topic, TOPIC_MOVE) == 0) {
-    sendKeyValToMotor("MOV", payload, length);
-  } else if (strcmp(topic, TOPIC_FORKLIFT) == 0) {
-    sendKeyValToMotor("FRK", payload, length);
-  } else {
-    // ignore
-  }
-}
+  for (;;) {
+    Dir dir;
+    uint8_t duty;
 
-// (A) Non-blocking WiFi connect attempt
-static void ensureWiFiOnce() {
-  static unsigned long lastAttemptMs = 0;
-  const unsigned long now = millis();
+    xSemaphoreTake(g_ctrlMutex, portMAX_DELAY);
+    dir = g_m1_dir;
+    duty = g_duty;
+    xSemaphoreGive(g_ctrlMutex);
 
-  if (WiFi.status() == WL_CONNECTED) return;
-  if (now - lastAttemptMs < 2000) return;  // backoff
-  lastAttemptMs = now;
-
-  if (DEBUG_LOG) Serial.println("WiFi: begin()");
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(true);          // reduces peaks a bit (may increase latency)
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-}
-
-// (A) Non-blocking MQTT connect attempt
-static void ensureMQTTOnce() {
-  static unsigned long lastAttemptMs = 0;
-  const unsigned long now = millis();
-
-  if (WiFi.status() != WL_CONNECTED) return;
-  if (mqtt.connected()) return;
-  if (now - lastAttemptMs < 2000) return;  // backoff
-  lastAttemptMs = now;
-
-  mqtt.setServer(MQTT_HOST, MQTT_PORT);
-  mqtt.setCallback(mqttCallback);
-
-  if (DEBUG_LOG) {
-    Serial.print("MQTT: connect ");
-    Serial.print(MQTT_HOST);
-    Serial.print(":");
-    Serial.println(MQTT_PORT);
-  }
-
-  bool ok;
-  if (strlen(MQTT_USERNAME) > 0) ok = mqtt.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD);
-  else ok = mqtt.connect(MQTT_CLIENT_ID);
-
-  if (ok) {
-    if (DEBUG_LOG) Serial.println("MQTT: connected");
-    mqtt.subscribe(TOPIC_MOVE, 1);
-    mqtt.subscribe(TOPIC_SPEED, 1);
-    mqtt.subscribe(TOPIC_FORKLIFT, 1);
-    sendRawToMotor("MOV:stop");
-  } else {
-    if (DEBUG_LOG) {
-      Serial.print("MQTT: failed rc=");
-      Serial.println(mqtt.state());
+    if (dir != lastDir || duty != lastDuty) {
+      motorApply(M1_PWM_PIN, M1_DIR1_PIN, M1_DIR2_PIN, dir, duty);
+      lastDir = dir;
+      lastDuty = duty;
     }
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+static void motorTask2(void* pv) {
+  Dir lastDir = (Dir)255;
+  uint8_t lastDuty = 255;
+
+  for (;;) {
+    Dir dir;
+    uint8_t duty;
+
+    xSemaphoreTake(g_ctrlMutex, portMAX_DELAY);
+    dir = g_m2_dir;
+    duty = g_duty;
+    xSemaphoreGive(g_ctrlMutex);
+
+    if (dir != lastDir || duty != lastDuty) {
+      motorApply(M2_PWM_PIN, M2_DIR1_PIN, M2_DIR2_PIN, dir, duty);
+      lastDir = dir;
+      lastDuty = duty;
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+static void setMove(const String& cmd) {
+  xSemaphoreTake(g_ctrlMutex, portMAX_DELAY);
+
+  if (cmd == "w") {
+    g_m1_dir = DIR_FWD; g_m2_dir = DIR_FWD;
+  } else if (cmd == "s") {
+    g_m1_dir = DIR_REV; g_m2_dir = DIR_REV;
+  } else if (cmd == "a") {
+    g_m1_dir = DIR_REV; g_m2_dir = DIR_FWD;
+  } else if (cmd == "d") {
+    g_m1_dir = DIR_FWD; g_m2_dir = DIR_REV;
+  } else {
+    g_m1_dir = DIR_STOP; g_m2_dir = DIR_STOP;
+  }
+
+  g_seenMoveCmd = true;
+  xSemaphoreGive(g_ctrlMutex);
+}
+
+static void setSpeed(const String& msg) {
+  int v = msg.toInt();
+  uint8_t duty = clampDuty(v);
+
+  xSemaphoreTake(g_ctrlMutex, portMAX_DELAY);
+  g_duty = duty;
+  xSemaphoreGive(g_ctrlMutex);
+}
+
+static void handleLine(const String& line) {
+  if (line.startsWith("SPD:")) {
+    setSpeed(line.substring(4));
+    GatewaySerial.println("ACK:SPD");
+    return;
+  }
+  if (line.startsWith("MOV:")) {
+    setMove(line.substring(4));
+    GatewaySerial.println("ACK:MOV");
+    return;
+  }
+  if (line.startsWith("FRK:")) {
+    GatewaySerial.println("ACK:FRK");
+    return;
+  }
+  if (line == "HELLO") {
+    GatewaySerial.println("ACK:HELLO");
   }
 }
 
 void setup() {
   Serial.begin(115200);
 
-  MotorSerial.begin(UART_BAUD, SERIAL_8N1, UART_RX, UART_TX);
-  delay(200);
-  sendRawToMotor("HELLO");
+  // UART from gateway
+  GatewaySerial.begin(UART_BAUD, SERIAL_8N1, UART_RX, UART_TX);
 
-  // (B) Soft-start delay BEFORE WiFi to reduce brownout risk
-  delay(5000);
+  // Direction pins
+  pinMode(M1_DIR1_PIN, OUTPUT);
+  pinMode(M1_DIR2_PIN, OUTPUT);
+  pinMode(M2_DIR1_PIN, OUTPUT);
+  pinMode(M2_DIR2_PIN, OUTPUT);
 
-  ensureWiFiOnce();
-  // MQTT connect will happen after WiFi is actually up
+  digitalWrite(M1_DIR1_PIN, LOW);
+  digitalWrite(M1_DIR2_PIN, LOW);
+  digitalWrite(M2_DIR1_PIN, LOW);
+  digitalWrite(M2_DIR2_PIN, LOW);
+
+  // PWM attach (Arduino-ESP32 core v3 style)
+  ledcAttach(M1_PWM_PIN, M1_FREQ, RESOLUTION);
+  ledcAttach(M2_PWM_PIN, M2_FREQ, RESOLUTION);
+  ledcWrite(M1_PWM_PIN, 0);
+  ledcWrite(M2_PWM_PIN, 0);
+
+  g_ctrlMutex = xSemaphoreCreateMutex();
+
+  xTaskCreatePinnedToCore(motorTask1, "Motor1_Task", 4096, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(motorTask2, "Motor2_Task", 4096, NULL, 1, NULL, 1);
+
+  Serial.println("Motor controller ready.");
 }
 
 void loop() {
-  ensureWiFiOnce();
-  ensureMQTTOnce();
-
-  if (mqtt.connected()) mqtt.loop();
-
-  // Optional: read motor responses (keep it cheap)
-  while (MotorSerial.available()) {
-    String line = MotorSerial.readStringUntil('\n');
+  // Read lines from gateway
+  while (GatewaySerial.available()) {
+    String line = GatewaySerial.readStringUntil('\n');
     line.trim();
-    if (line.length() && DEBUG_LOG) {
-      Serial.print("MOTOR->UART: ");
+    if (line.length()) {
+      Serial.print("UART RX: ");
       Serial.println(line);
+      handleLine(line);
     }
+  }
+
+  // Optional self-test so you always see PWM on scope even without ESP1
+  if (SELFTEST_ENABLE && !g_seenMoveCmd && millis() > SELFTEST_AFTER_MS) {
+    Serial.println("SELFTEST: no MOV received, generating PWM...");
+    setSpeed(String(g_duty));
+    setMove("w");
+    delay(SELFTEST_ON_MS);
+    setMove("stop");
+    delay(SELFTEST_OFF_MS);
   }
 
   delay(5);

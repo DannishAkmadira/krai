@@ -4,7 +4,7 @@
 # ─────────────────────────────────────────────
 
 # ── MQTT ──────────────────────────────────────
-MQTT_HOST      = "10.60.112.32"  # ganti dengan host HiveMQ
+MQTT_HOST      = "10.90.50.32"  # ganti dengan host HiveMQ
 MQTT_PORT      = 1883                        # port TLS HiveMQ cloud
 MQTT_USERNAME  = "DanishAkmadira"                  # ganti dengan username HiveMQ
 MQTT_PASSWORD  = "@November24"                  # ganti dengan password HiveMQ
